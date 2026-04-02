@@ -8,18 +8,18 @@ jobs:
 
     steps:
     - name: Download the Repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
 
     - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v1.0.2
+      uses: microsoft/setup-msbuild@v2
 
     - name: Compile
       working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: msbuild
+      run: msbuild /p:Configuration=Release /p:Platform=x64
 
     - name: Uploading artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: UEFN Unlocker
-        path: build/UEFN-Unlocker.dll
+        path: x64/Release/UEFN-Unlocker.dll
         if-no-files-found: error
