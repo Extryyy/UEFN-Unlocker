@@ -9,18 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 const char* logo =
-R"( _____  _____  ________  ________  ____  _____
-|_   _||_   _||_   __  ||_   __  ||_   \|_   _|
-  | |    | |    | |_ \_|  | |_ \_|  |   \ | |
-  | '    ' |    |  _| _   |  _|     | |\ \| |
-   \ \__/ /    _| |__/ | _| |_     _| |_\   |_
-    `.__.'    |_________|_____|   |_____|_____|
- ____________         __                 __
-|_   _||_   _|       [  |               [  |  _
-  | |    | | _ .--.   | |  .--.   .---.  | | / ] .---.  _ .--.
-  | '    ' |[ `.-. |  | |/ .'`\ \/ /'`\] | '' < / /__\\[ `/'`\]
-   \ \__/ /  | | | |  | || \__. || \__.  | |`\ \| \__., | |
-    `.__.'  [___||__][___]'.__.' '.___.'[__|  \_]'.__.'[___]
+R"(UEFN Unlocker By Extry
 
 )";
 
@@ -155,11 +144,11 @@ static uintptr_t FindCannotModifyCookedAssetsPatchAddress(HMODULE module, const 
 
 void Main(const HMODULE hModule) {
     AllocConsole();
-    SetConsoleTitleA("UEFN Unlocker by gamerbross v1.3");
+    SetConsoleTitleA("UEFN Unlocker By Extry");
     FILE* pFile;
     freopen_s(&pFile, ("CONOUT$"), "w", stdout);
 
-    std::cout << logo << "Made by @gamerbross_ on X/Twitter!\n";
+    std::cout << logo << "Made by Extry to save the fishes\n";
 
     // rel16/32
     static const std::vector<BYTE> jeBytes  = { 0x0F, 0x84 };
