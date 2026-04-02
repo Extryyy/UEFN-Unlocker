@@ -5,7 +5,7 @@
 #include <cstring>
 #include <cwchar>
 #include <vector>
-#include <psapi.h>          // For EnumProcessModules (process-wide module scan)
+#include <psapi.h>          // For EnumProcessModules
 #include <memcury.h>
 
 #pragma comment(lib, "psapi.lib")
@@ -84,92 +84,7 @@ static uintptr_t FindWideStringInModule(HMODULE module, const wchar_t* value) {
 }
 
 // ===================================================================
-// ULTRA-AGGRESSIVE PROCESS-WIDE STRING SEARCH
-// Scans EVERY loaded module in the process for the string (Valkyrie.dll, main exe, editor DLLs, etc.)
-// This is the most aggressive string locator possible.
-// ===================================================================
-static uintptr_t FindWideStringProcessWide(const wchar_t* value, HMODULE& outModule) {
-    outModule = nullptr;
-
-    HMODULE hMods[1024];
-    DWORD cbNeeded;
-
-    if (!EnumProcessModules(currentProcess, hMods, sizeof(hMods), &cbNeeded)) {
-        return 0;
-    }
-
-    const int count = cbNeeded / sizeof(HMODULE);
-    for (int i = 0; i < count; ++i) {
-        HMODULE hMod = hMods[i];
-        uintptr_t addr = FindWideStringInModule(hMod, value);
-        if (addr) {
-            outModule = hMod;
-            return addr;
-        }
-    }
-    return 0;
-}
-
-// ===================================================================
-// BRUTE-FORCE FUNCTION LOCATOR (now process-wide + fallback to Memcury)
-// ===================================================================
-static uintptr_t FindCannotModifyCookedAssetsPatchAddress() {
-    std::cout << "[+] Searching for Error_CannotModifyCookedAssets (PROCESS-WIDE ultra-aggressive mode)...\n";
-
-    HMODULE stringModule = nullptr;
-    const auto markerAddress = FindWideStringProcessWide(L"Error_CannotModifyCookedAssets", stringModule);
-
-    if (!markerAddress) {
-        std::cout << "[-] String NOT found in ANY module (Epic likely removed the literal in v40.10+)\n";
-        std::cout << "    Falling back to Memcury FindStringRef (scans .text references)...\n";
-
-        auto refScanner = Memcury::Scanner::FindStringRef(L"Error_CannotModifyCookedAssets", false);
-        if (!refScanner.Get()) {
-            std::cout << "[-] Memcury FindStringRef also failed.\n";
-            return 0;
-        }
-        std::cout << "[+] Memcury reference found at 0x" << std::hex << refScanner.Get() << std::dec << "\n";
-
-        auto funcBoundary = refScanner.FindFunctionBoundary();
-        uintptr_t funcStart = funcBoundary.Get();
-        if (!funcStart) return 0;
-
-        std::cout << "[+] Function start (from Memcury) at 0x" << std::hex << funcStart << std::dec << "\n";
-        return funcStart;
-    }
-
-    std::cout << "[+] String found at 0x" << std::hex << markerAddress << std::dec << " (module: " << stringModule << ")\n";
-
-    SectionView textSection {};
-    if (!GetSectionView(stringModule, ".text", textSection)) {
-        std::cout << "[-] .text section not found in string's module!\n";
-        return 0;
-    }
-
-    // Reuse the ultra-aggressive reference finder from earlier (now works because we have the module)
-    // (It already handles multiple LEA/MOV rip-relative patterns)
-    const auto leaRef = FindRipLeaReference(textSection.base, textSection.size, markerAddress);  // <-- defined below
-    if (!leaRef) {
-        std::cout << "[-] No rip-relative reference found in .text\n";
-        return 0;
-    }
-    std::cout << "[+] Reference (LEA/MOV) found at 0x" << std::hex << leaRef << std::dec << "\n";
-
-    Memcury::Scanner refScanner(leaRef);
-    auto funcBoundary = refScanner.FindFunctionBoundary();
-    uintptr_t funcStart = funcBoundary.Get();
-
-    if (!funcStart) {
-        std::cout << "[-] Function boundary not found\n";
-        return 0;
-    }
-
-    std::cout << "[+] Function start located at 0x" << std::hex << funcStart << std::dec << "\n";
-    return funcStart;
-}
-
-// ===================================================================
-// AGGRESSIVE REFERENCE FINDER (same as previous ultra version)
+// AGGRESSIVE REFERENCE FINDER (moved to top so it is visible to all functions)
 // ===================================================================
 static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintptr_t targetAddress) {
     if (!textBase || textSize < 6) return 0;
@@ -194,6 +109,89 @@ static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintpt
         }
     }
     return 0;
+}
+
+// ===================================================================
+// PROCESS-WIDE STRING SEARCH
+// ===================================================================
+static uintptr_t FindWideStringProcessWide(const wchar_t* value, HMODULE& outModule) {
+    outModule = nullptr;
+
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+
+    if (!EnumProcessModules(currentProcess, hMods, sizeof(hMods), &cbNeeded)) {
+        return 0;
+    }
+
+    const int count = cbNeeded / sizeof(HMODULE);
+    for (int i = 0; i < count; ++i) {
+        HMODULE hMod = hMods[i];
+        uintptr_t addr = FindWideStringInModule(hMod, value);
+        if (addr) {
+            outModule = hMod;
+            return addr;
+        }
+    }
+    return 0;
+}
+
+// ===================================================================
+// BRUTE-FORCE FUNCTION LOCATOR (process-wide)
+// ===================================================================
+static uintptr_t FindCannotModifyCookedAssetsPatchAddress() {
+    std::cout << "[+] Searching for Error_CannotModifyCookedAssets (PROCESS-WIDE ultra-aggressive mode)...\n";
+
+    HMODULE stringModule = nullptr;
+    const auto markerAddress = FindWideStringProcessWide(L"Error_CannotModifyCookedAssets", stringModule);
+
+    if (!markerAddress) {
+        std::cout << "[-] String NOT found in ANY module (Epic likely removed the literal in v40.10+)\n";
+        std::cout << "    Falling back to Memcury FindStringRef...\n";
+
+        auto refScanner = Memcury::Scanner::FindStringRef(L"Error_CannotModifyCookedAssets", false);
+        if (!refScanner.Get()) {
+            std::cout << "[-] Memcury FindStringRef also failed.\n";
+            return 0;
+        }
+        std::cout << "[+] Memcury reference found at 0x" << std::hex << refScanner.Get() << std::dec << "\n";
+
+        auto funcBoundary = refScanner.FindFunctionBoundary();
+        uintptr_t funcStart = funcBoundary.Get();
+        if (!funcStart) return 0;
+
+        std::cout << "[+] Function start (from Memcury) at 0x" << std::hex << funcStart << std::dec << "\n";
+        return funcStart;
+    }
+
+    std::cout << "[+] String found at 0x" << std::hex << markerAddress 
+              << std::dec << " (module: 0x" << std::hex << reinterpret_cast<uintptr_t>(stringModule) 
+              << std::dec << ")\n";
+
+    SectionView textSection {};
+    if (!GetSectionView(stringModule, ".text", textSection)) {
+        std::cout << "[-] .text section not found in string's module!\n";
+        return 0;
+    }
+
+    const auto leaRef = FindRipLeaReference(textSection.base, textSection.size, markerAddress);
+    if (!leaRef) {
+        std::cout << "[-] No rip-relative reference found in .text\n";
+        return 0;
+    }
+    std::cout << "[+] Reference (LEA/MOV) found at 0x" << std::hex << leaRef << std::dec << "\n";
+
+    Memcury::Scanner refScanner(leaRef);
+    auto funcBoundary = refScanner.FindFunctionBoundary();
+    uintptr_t funcStart = funcBoundary.Get();
+
+    if (!funcStart) {
+        std::cout << "[-] Function boundary not found\n";
+        return 0;
+    }
+
+    std::cout << "[+] Function start located at 0x" << std::hex << funcStart << std::dec << "\n";
+    return funcStart;
 }
 
 void Main(const HMODULE hModule) {
@@ -230,16 +228,12 @@ void Main(const HMODULE hModule) {
 
     std::cout << "[+] Cooked asset check module: " << (usingValkyrieModule ? "Valkyrie.dll" : "Main module") << "\n";
 
-    // ===================================================================
-    // PROCESS-WIDE BRUTE-FORCE PATCH
-    // ===================================================================
     auto cookedAssetPatchAddress = FindCannotModifyCookedAssetsPatchAddress();
     MemcuryAssertM(cookedAssetPatchAddress, "AOB scan failed for Error_CannotModifyCookedAssets patch! (string + reference + function boundary not found in ANY module)");
 
     writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01, 0xC3 }); // mov al, 1; ret
     std::cout << "[+] Brute-force return-true patch applied!\n";
 
-    // Rest of your patches (unchanged)
     auto AssetCantBeEdited = Memcury::Scanner::FindStringRef(L"AssetCantBeEdited", false);
     if (!AssetCantBeEdited.Get()) AssetCantBeEdited = Memcury::Scanner::FindStringRef(L"NotifyBlockedByCookedAsset", false);
 
