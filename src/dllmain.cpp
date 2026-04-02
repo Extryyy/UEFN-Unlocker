@@ -16,7 +16,14 @@ R"(UEFN Unlocker By Extry
 static auto currentProcess = GetCurrentProcess();
 
 inline void writeMemory(const uintptr_t address, const std::vector<BYTE>& toWrite) {
-    WriteProcessMemory(currentProcess, (LPVOID)address, toWrite.data(), toWrite.size(), NULL);
+    if (address == 0) return;
+
+    // Improved: always make the page writable first (required for .text patches in newer UEFN)
+    DWORD oldProtect = 0;
+    if (VirtualProtect(reinterpret_cast<LPVOID>(address), toWrite.size(), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        WriteProcessMemory(currentProcess, reinterpret_cast<LPVOID>(address), toWrite.data(), toWrite.size(), nullptr);
+        VirtualProtect(reinterpret_cast<LPVOID>(address), toWrite.size(), oldProtect, &oldProtect);
+    }
 }
 
 struct SectionView {
@@ -94,52 +101,31 @@ static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintpt
     return 0;
 }
 
-static uintptr_t FindNearbyPattern(uintptr_t center, uintptr_t searchMin, uintptr_t searchMax, const std::vector<BYTE>& pattern) {
-    if (!center || pattern.empty()) return 0;
-
-    const auto begin = (center > searchMin) ? center : searchMin;
-    const auto end = searchMax;
-    if (begin >= end || end - begin < pattern.size()) return 0;
-
-    auto* bytes = reinterpret_cast<const BYTE*>(begin);
-    const auto scanSize = static_cast<size_t>(end - begin);
-
-    for (size_t i = 0; i <= scanSize - pattern.size(); ++i) {
-        bool match = true;
-        for (size_t j = 0; j < pattern.size(); ++j) {
-            if (bytes[i + j] != pattern[j]) {
-                match = false;
-                break;
-            }
-        }
-
-        if (match) {
-            return begin + i;
-        }
-    }
-
-    return 0;
-}
-
+// ===================================================================
+// UPDATED: Brute-force function detour/patch for Error_CannotModifyCookedAssets
+// ===================================================================
 static uintptr_t FindCannotModifyCookedAssetsPatchAddress(HMODULE module, const wchar_t* markerString) {
+    // Step 1: Locate the wide string (kept your exact reliable custom scanner)
     const auto markerAddress = FindWideStringInModule(module, markerString);
     if (!markerAddress) return 0;
 
+    // Step 2: Get .text section of the correct module
     SectionView textSection {};
     if (!GetSectionView(module, ".text", textSection)) return 0;
 
+    // Step 3: Find the RIP-relative LEA that references the string (this is the code reference inside the function)
     const auto leaRef = FindRipLeaReference(textSection.base, textSection.size, markerAddress);
     if (!leaRef) return 0;
 
-    const auto searchStart = leaRef;
-    const auto searchEnd = min(textSection.base + textSection.size, leaRef + 0x800);
+    // Step 4: Brute-force locate the function prologue using Memcury's most aggressive scanner
+    // (This replaces the old brittle xor al,al / xor eax,eax near-pattern that Epic broke in v40.10)
+    Memcury::Scanner refScanner(leaRef);                    // Scanner positioned at the LEA reference
+    auto funcBoundary = refScanner.FindFunctionBoundary();  // Scans backward with generous wildcards for prologue
+    uintptr_t funcStart = funcBoundary.Get();
 
-    uintptr_t xorPatchAddress = FindNearbyPattern(searchStart, searchStart, searchEnd, { 0x32, 0xC0 }); // xor al, al
-    if (!xorPatchAddress) {
-        xorPatchAddress = FindNearbyPattern(searchStart, searchStart, searchEnd, { 0x31, 0xC0 }); // xor eax, eax
-    }
+    if (!funcStart) return 0;
 
-    return xorPatchAddress;
+    return funcStart;   // We now return the *start* of the function, not an inner xor
 }
 
 void Main(const HMODULE hModule) {
@@ -181,11 +167,19 @@ void Main(const HMODULE hModule) {
 
     std::cout << "[+] Cooked asset check module: " << (usingValkyrieModule ? "Valkyrie.dll" : "Main module") << "\n";
 
+    // ===================================================================
+    // NEW BRUTE-FORCE PATCH (replaces the old xor scan)
+    // ===================================================================
+    std::cout << "[+] Searching for Error_CannotModifyCookedAssets (string + LEA ref + function boundary)...\n";
     auto cookedAssetPatchAddress = FindCannotModifyCookedAssetsPatchAddress(targetModule, cookedAssetErrorString);
-    MemcuryAssertM(cookedAssetPatchAddress, "AOB scan failed for Error_CannotModifyCookedAssets patch!");
+    MemcuryAssertM(cookedAssetPatchAddress, "AOB scan failed for Error_CannotModifyCookedAssets patch! (string/LEA/function boundary not found)");
 
-    writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01 }); // mov al, 1
+    // Patch the *very beginning* of the function → immediately return success (true)
+    // This is the brute-force detour you asked for. Survives any internal assembly changes.
+    writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01, 0xC3 }); // mov al, 1; ret
+    std::cout << "[+] Brute-force return-true patch applied to Error_CannotModifyCookedAssets function!\n";
 
+    // Rest of your original patches (unchanged, kept for full compatibility)
     auto AssetCantBeEdited = Memcury::Scanner::FindStringRef(L"AssetCantBeEdited", false);
     if (!AssetCantBeEdited.Get()) AssetCantBeEdited = Memcury::Scanner::FindStringRef(L"NotifyBlockedByCookedAsset", false);
 
@@ -241,7 +235,6 @@ BOOL APIENTRY DllMain(const HMODULE hModule, const DWORD dwReason, const LPVOID 
     case DLL_PROCESS_DETACH:
         break;
     }
-
 
     return TRUE;
 }
