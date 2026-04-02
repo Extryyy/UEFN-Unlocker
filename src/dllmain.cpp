@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <iostream>
+#include <iomanip>
 #include <cstring>
 #include <cwchar>
 #include <vector>
@@ -18,7 +19,6 @@ static auto currentProcess = GetCurrentProcess();
 inline void writeMemory(const uintptr_t address, const std::vector<BYTE>& toWrite) {
     if (address == 0) return;
 
-    // Improved: always make the page writable first (required for .text patches in newer UEFN)
     DWORD oldProtect = 0;
     if (VirtualProtect(reinterpret_cast<LPVOID>(address), toWrite.size(), PAGE_EXECUTE_READWRITE, &oldProtect)) {
         WriteProcessMemory(currentProcess, reinterpret_cast<LPVOID>(address), toWrite.data(), toWrite.size(), nullptr);
@@ -80,21 +80,48 @@ static uintptr_t FindWideStringInModule(HMODULE module, const wchar_t* value) {
     return 0;
 }
 
+// ===================================================================
+// BRUTE-FORCE REFERENCE FINDER (updated for v40.10+)
+// Now checks for:
+//   - Any REX + LEA [rip+disp32]
+//   - Plain LEA [rip+disp32] (no REX)
+//   - Any REX + MOV reg, [rip+disp32]
+// This is the most aggressive "find any reference to the string" possible.
+// ===================================================================
 static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintptr_t targetAddress) {
-    if (!textBase || textSize < 7) return 0;
+    if (!textBase || textSize < 6) return 0;
 
     auto* bytes = reinterpret_cast<const BYTE*>(textBase);
+
     for (size_t i = 0; i <= textSize - 7; ++i) {
-        // 48 8D /r with modrm indicating [rip+disp32]
-        if (bytes[i] != 0x48 || bytes[i + 1] != 0x8D || (bytes[i + 2] & 0xC7) != 0x05) {
-            continue;
+        // Case 1: REX + LEA [rip + disp32]  (48 8D ? 05, 4C 8D ? 05, etc.)
+        if ((bytes[i] & 0xF0) == 0x40 && bytes[i + 1] == 0x8D && (bytes[i + 2] & 0xC7) == 0x05) {
+            const int32_t displacement = *reinterpret_cast<const int32_t*>(bytes + i + 3);
+            const auto instruction = textBase + i;
+            const auto resolved = instruction + 7 + displacement;
+            if (resolved == targetAddress) {
+                return instruction;
+            }
         }
 
-        const int32_t displacement = *reinterpret_cast<const int32_t*>(bytes + i + 3);
-        const auto instruction = textBase + i;
-        const auto resolved = instruction + 7 + displacement;
-        if (resolved == targetAddress) {
-            return instruction;
+        // Case 2: LEA [rip + disp32] without REX (8D 05 ..)
+        if (bytes[i] == 0x8D && (bytes[i + 1] & 0xC7) == 0x05) {
+            const int32_t displacement = *reinterpret_cast<const int32_t*>(bytes + i + 2);
+            const auto instruction = textBase + i;
+            const auto resolved = instruction + 6 + displacement;
+            if (resolved == targetAddress) {
+                return instruction;
+            }
+        }
+
+        // Case 3: REX + MOV reg, [rip + disp32]  (48 8B ? 05, etc.)
+        if ((bytes[i] & 0xF0) == 0x40 && bytes[i + 1] == 0x8B && (bytes[i + 2] & 0xC7) == 0x05) {
+            const int32_t displacement = *reinterpret_cast<const int32_t*>(bytes + i + 3);
+            const auto instruction = textBase + i;
+            const auto resolved = instruction + 7 + displacement;
+            if (resolved == targetAddress) {
+                return instruction;
+            }
         }
     }
 
@@ -102,30 +129,46 @@ static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintpt
 }
 
 // ===================================================================
-// UPDATED: Brute-force function detour/patch for Error_CannotModifyCookedAssets
+// UPDATED BRUTE-FORCE FUNCTION LOCATOR FOR Error_CannotModifyCookedAssets
 // ===================================================================
 static uintptr_t FindCannotModifyCookedAssetsPatchAddress(HMODULE module, const wchar_t* markerString) {
-    // Step 1: Locate the wide string (kept your exact reliable custom scanner)
+    std::cout << "[+] Searching for Error_CannotModifyCookedAssets (string + reference + function boundary)...\n";
+
+    // Step 1: Find the wide string data
     const auto markerAddress = FindWideStringInModule(module, markerString);
-    if (!markerAddress) return 0;
+    if (!markerAddress) {
+        std::cout << "[-] String NOT found in module memory!\n";
+        return 0;
+    }
+    std::cout << "[+] String found at 0x" << std::hex << markerAddress << std::dec << "\n";
 
-    // Step 2: Get .text section of the correct module
+    // Step 2: Get .text section
     SectionView textSection {};
-    if (!GetSectionView(module, ".text", textSection)) return 0;
+    if (!GetSectionView(module, ".text", textSection)) {
+        std::cout << "[-] .text section not found!\n";
+        return 0;
+    }
 
-    // Step 3: Find the RIP-relative LEA that references the string (this is the code reference inside the function)
+    // Step 3: Find ANY reference to the string (LEA or MOV rip-relative) - this is the brute-force part
     const auto leaRef = FindRipLeaReference(textSection.base, textSection.size, markerAddress);
-    if (!leaRef) return 0;
+    if (!leaRef) {
+        std::cout << "[-] No reference (LEA/MOV rip-relative) to the string found in .text!\n";
+        return 0;
+    }
+    std::cout << "[+] Reference (LEA/MOV) found at 0x" << std::hex << leaRef << std::dec << "\n";
 
-    // Step 4: Brute-force locate the function prologue using Memcury's most aggressive scanner
-    // (This replaces the old brittle xor al,al / xor eax,eax near-pattern that Epic broke in v40.10)
-    Memcury::Scanner refScanner(leaRef);                    // Scanner positioned at the LEA reference
-    auto funcBoundary = refScanner.FindFunctionBoundary();  // Scans backward with generous wildcards for prologue
+    // Step 4: Use Memcury's aggressive function boundary scanner (scans backward for RET/INT3)
+    Memcury::Scanner refScanner(leaRef);
+    auto funcBoundary = refScanner.FindFunctionBoundary();
     uintptr_t funcStart = funcBoundary.Get();
 
-    if (!funcStart) return 0;
+    if (!funcStart) {
+        std::cout << "[-] Function boundary (prologue) not found!\n";
+        return 0;
+    }
+    std::cout << "[+] Function start located at 0x" << std::hex << funcStart << std::dec << "\n";
 
-    return funcStart;   // We now return the *start* of the function, not an inner xor
+    return funcStart;
 }
 
 void Main(const HMODULE hModule) {
@@ -141,7 +184,7 @@ void Main(const HMODULE hModule) {
     static const std::vector<BYTE> jneBytes = { 0x0F, 0x85 };
     static const std::vector<BYTE> jlBytes  = { 0x0F, 0x8C };
 
-    static const std::vector<BYTE> jnoBytes = { 0x0F, 0x81 }; // using jump if not overflow cus easier and should always work
+    static const std::vector<BYTE> jnoBytes = { 0x0F, 0x81 };
     static const std::vector<BYTE> nopBytes = { 0x90, 0x90 };
 
     // rel8
@@ -168,27 +211,22 @@ void Main(const HMODULE hModule) {
     std::cout << "[+] Cooked asset check module: " << (usingValkyrieModule ? "Valkyrie.dll" : "Main module") << "\n";
 
     // ===================================================================
-    // NEW BRUTE-FORCE PATCH (replaces the old xor scan)
+    // BRUTE-FORCE PATCH (string → reference → function start → immediate return true)
     // ===================================================================
-    std::cout << "[+] Searching for Error_CannotModifyCookedAssets (string + LEA ref + function boundary)...\n";
     auto cookedAssetPatchAddress = FindCannotModifyCookedAssetsPatchAddress(targetModule, cookedAssetErrorString);
-    MemcuryAssertM(cookedAssetPatchAddress, "AOB scan failed for Error_CannotModifyCookedAssets patch! (string/LEA/function boundary not found)");
+    MemcuryAssertM(cookedAssetPatchAddress, "AOB scan failed for Error_CannotModifyCookedAssets patch! (string/reference/function boundary not found - see console for details)");
 
-    // Patch the *very beginning* of the function → immediately return success (true)
-    // This is the brute-force detour you asked for. Survives any internal assembly changes.
-    writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01, 0xC3 }); // mov al, 1; ret
+    // Patch the function prologue to always return success (mov al, 1; ret)
+    writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01, 0xC3 });
     std::cout << "[+] Brute-force return-true patch applied to Error_CannotModifyCookedAssets function!\n";
 
-    // Rest of your original patches (unchanged, kept for full compatibility)
+    // Rest of your original patches (unchanged)
     auto AssetCantBeEdited = Memcury::Scanner::FindStringRef(L"AssetCantBeEdited", false);
     if (!AssetCantBeEdited.Get()) AssetCantBeEdited = Memcury::Scanner::FindStringRef(L"NotifyBlockedByCookedAsset", false);
 
     MemcuryAssertM(AssetCantBeEdited.Get(), "Unable to Edit Cooked asset could not be found!");
 
-    writeMemory(AssetCantBeEdited
-        .ScanFor(xorByte).Get(),
-        { 0xB3, 0x01 } // mov bl, 1
-    );
+    writeMemory(AssetCantBeEdited.ScanFor(xorByte).Get(), { 0xB3, 0x01 });
 
     writeMemory(
         Memcury::Scanner::FindStringRef(L"Folder '{0}' is read only and its contents cannot be edited")
