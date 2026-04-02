@@ -125,7 +125,7 @@ static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintpt
 }
 
 // ===================================================================
-// AGGRESSIVE STRING REFERENCE FINDER (works for ALL strings in v40.10+)
+// AGGRESSIVE STRING REFERENCE FINDER
 // ===================================================================
 static Memcury::Scanner FindStringRefAggressive(const wchar_t* str) {
     auto scanner = Memcury::Scanner::FindStringRef(str, false);
@@ -148,6 +148,31 @@ static Memcury::Scanner FindStringRefAggressive(const wchar_t* str) {
     }
 
     return Memcury::Scanner(ref);
+}
+
+// ===================================================================
+// BRUTE-FORCE PATCH FOR Error_CannotModifyCookedAssets
+// ===================================================================
+static uintptr_t FindCannotModifyCookedAssetsPatchAddress() {
+    HMODULE stringModule = nullptr;
+    const auto markerAddress = FindWideStringProcessWide(L"Error_CannotModifyCookedAssets", stringModule);
+
+    if (!markerAddress) {
+        auto refScanner = Memcury::Scanner::FindStringRef(L"Error_CannotModifyCookedAssets", false);
+        if (!refScanner.Get()) return 0;
+        auto funcBoundary = refScanner.FindFunctionBoundary();
+        return funcBoundary.Get();
+    }
+
+    SectionView textSection {};
+    if (!GetSectionView(stringModule, ".text", textSection)) return 0;
+
+    const auto leaRef = FindRipLeaReference(textSection.base, textSection.size, markerAddress);
+    if (!leaRef) return 0;
+
+    Memcury::Scanner refScanner(leaRef);
+    auto funcBoundary = refScanner.FindFunctionBoundary();
+    return funcBoundary.Get();
 }
 
 void Main(const HMODULE hModule) {
@@ -181,14 +206,14 @@ void Main(const HMODULE hModule) {
 
     std::cout << "[+] Cooked asset check module: " << (usingValkyrieModule ? "Valkyrie.dll" : "Main module") << "\n";
 
-    // ==================== 1. Error_CannotModifyCookedAssets ====================
-    auto cookedAssetPatchAddress = FindCannotModifyCookedAssetsPatchAddress();  // (defined below)
+    // 1. Error_CannotModifyCookedAssets
+    auto cookedAssetPatchAddress = FindCannotModifyCookedAssetsPatchAddress();
     MemcuryAssertM(cookedAssetPatchAddress, "AOB scan failed for Error_CannotModifyCookedAssets patch!");
 
     writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01, 0xC3 });
     std::cout << "[+] Brute-force return-true patch applied to Error_CannotModifyCookedAssets!\n";
 
-    // ==================== 2. AssetCantBeEdited / NotifyBlockedByCookedAsset ====================
+    // 2. AssetCantBeEdited / NotifyBlockedByCookedAsset
     std::cout << "[+] Searching for AssetCantBeEdited / NotifyBlockedByCookedAsset (aggressive mode)...\n";
     auto AssetCantBeEdited = FindStringRefAggressive(L"AssetCantBeEdited");
     if (!AssetCantBeEdited.Get()) AssetCantBeEdited = FindStringRefAggressive(L"NotifyBlockedByCookedAsset");
@@ -198,44 +223,44 @@ void Main(const HMODULE hModule) {
     writeMemory(AssetCantBeEdited.ScanFor(xorByte).Get(), { 0xB3, 0x01 });
     std::cout << "[+] mov bl, 1 patch applied to AssetCantBeEdited / NotifyBlockedByCookedAsset!\n";
 
-    // ==================== 3. Folder read-only (the one that was failing) ====================
+    // 3. Folder read-only
     std::cout << "[+] Patching Folder read-only check...\n";
     auto folderReadOnly = FindStringRefAggressive(L"Folder '{0}' is read only and its contents cannot be edited");
     if (folderReadOnly.Get()) {
         writeMemory(folderReadOnly.ScanFor(jneBytes, false).Get(), jnoBytes);
         std::cout << "[+] Folder read-only check patched!\n";
     } else {
-        std::cout << "[-] Folder read-only string not found (skipping, non-critical)\n";
+        std::cout << "[-] Folder read-only string not found (skipping)\n";
     }
 
-    // ==================== 4. Alias asset read-only ====================
+    // 4. Alias asset read-only
     std::cout << "[+] Patching Alias asset read-only check...\n";
     auto aliasReadOnly = FindStringRefAggressive(L"Alias asset '{0}' is in a read only folder. Unable to edit read only assets.");
     if (aliasReadOnly.Get()) {
         writeMemory(aliasReadOnly.ScanFor(jeBytes, false).Get(), jnoBytes);
         std::cout << "[+] Alias asset read-only check patched!\n";
     } else {
-        std::cout << "[-] Alias asset read-only string not found (skipping, non-critical)\n";
+        std::cout << "[-] Alias asset read-only string not found (skipping)\n";
     }
 
-    // ==================== 5. CannotDuplicateCooked ====================
+    // 5. CannotDuplicateCooked
     std::cout << "[+] Patching CannotDuplicateCooked...\n";
     auto cannotDup = FindStringRefAggressive(L"CannotDuplicateCooked");
     if (cannotDup.Get()) {
         writeMemory(cannotDup.FindFunctionBoundary().ScanFor(jlBytes).Get(), jnoBytes);
         std::cout << "[+] CannotDuplicateCooked patched!\n";
     } else {
-        std::cout << "[-] CannotDuplicateCooked string not found (skipping, non-critical)\n";
+        std::cout << "[-] CannotDuplicateCooked string not found (skipping)\n";
     }
 
-    // ==================== 6. Package is cooked or missing editor data ====================
+    // 6. Package is cooked or missing editor data
     std::cout << "[+] Patching Package cooked check...\n";
     auto packageCooked = FindStringRefAggressive(L"Package is cooked or missing editor data\n");
     if (packageCooked.Get()) {
         writeMemory(packageCooked.ScanFor(je8Byte, false).Get(), jmp8Byte);
         std::cout << "[+] Package cooked check patched!\n";
     } else {
-        std::cout << "[-] Package cooked string not found (skipping, non-critical)\n";
+        std::cout << "[-] Package cooked string not found (skipping)\n";
     }
 
     std::cout << "Done! All cooked-asset restrictions removed.\n";
@@ -248,31 +273,6 @@ void Main(const HMODULE hModule) {
     FreeConsole();
 
     FreeLibraryAndExitThread(hModule, 0);
-}
-
-// ===================================================================
-// BRUTE-FORCE PATCH FOR Error_CannotModifyCookedAssets (kept as-is)
-// ===================================================================
-static uintptr_t FindCannotModifyCookedAssetsPatchAddress() {
-    HMODULE stringModule = nullptr;
-    const auto markerAddress = FindWideStringProcessWide(L"Error_CannotModifyCookedAssets", stringModule);
-
-    if (!markerAddress) {
-        auto refScanner = Memcury::Scanner::FindStringRef(L"Error_CannotModifyCookedAssets", false);
-        if (!refScanner.Get()) return 0;
-        auto funcBoundary = refScanner.FindFunctionBoundary();
-        return funcBoundary.Get();
-    }
-
-    SectionView textSection {};
-    if (!GetSectionView(stringModule, ".text", textSection)) return 0;
-
-    const auto leaRef = FindRipLeaReference(textSection.base, textSection.size, markerAddress);
-    if (!leaRef) return 0;
-
-    Memcury::Scanner refScanner(leaRef);
-    auto funcBoundary = refScanner.FindFunctionBoundary();
-    return funcBoundary.Get();
 }
 
 BOOL APIENTRY DllMain(const HMODULE hModule, const DWORD dwReason, const LPVOID lpReserved)
