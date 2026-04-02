@@ -108,17 +108,14 @@ static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintpt
 
     auto* bytes = reinterpret_cast<const BYTE*>(textBase);
     for (size_t i = 0; i <= textSize - 7; ++i) {
-        // REX + LEA [rip+disp32]
         if ((bytes[i] & 0xF0) == 0x40 && bytes[i + 1] == 0x8D && (bytes[i + 2] & 0xC7) == 0x05) {
             const int32_t disp = *reinterpret_cast<const int32_t*>(bytes + i + 3);
             if (textBase + i + 7 + disp == targetAddress) return textBase + i;
         }
-        // LEA [rip+disp32] no REX
         if (bytes[i] == 0x8D && (bytes[i + 1] & 0xC7) == 0x05) {
             const int32_t disp = *reinterpret_cast<const int32_t*>(bytes + i + 2);
             if (textBase + i + 6 + disp == targetAddress) return textBase + i;
         }
-        // REX + MOV reg, [rip+disp32]
         if ((bytes[i] & 0xF0) == 0x40 && bytes[i + 1] == 0x8B && (bytes[i + 2] & 0xC7) == 0x05) {
             const int32_t disp = *reinterpret_cast<const int32_t*>(bytes + i + 3);
             if (textBase + i + 7 + disp == targetAddress) return textBase + i;
@@ -128,30 +125,35 @@ static uintptr_t FindRipLeaReference(uintptr_t textBase, size_t textSize, uintpt
 }
 
 // ===================================================================
-// NEW: AGGRESSIVE STRING REFERENCE FINDER (used for AssetCantBeEdited)
-//     Tries Memcury first, then falls back to process-wide raw string + reference scan
+// AGGRESSIVE STRING REFERENCE FINDER (used for AssetCantBeEdited)
 // ===================================================================
 static Memcury::Scanner FindStringRefAggressive(const wchar_t* str) {
-    // Try normal Memcury first (fast path for strings in main module)
+    // Fast path: normal Memcury (works for most strings)
     auto scanner = Memcury::Scanner::FindStringRef(str, false);
     if (scanner.Get()) return scanner;
 
-    // Fallback: process-wide raw string search + reference finder
+    // Fallback: process-wide raw string search + rip-relative reference
     HMODULE mod = nullptr;
     const auto strAddr = FindWideStringProcessWide(str, mod);
-    if (!strAddr || !mod) return Memcury::Scanner(0);
+    if (!strAddr || !mod) {
+        return Memcury::Scanner(Memcury::PE::Address(nullptr));   // fixed: explicit PE::Address
+    }
 
     SectionView text{};
-    if (!GetSectionView(mod, ".text", text)) return Memcury::Scanner(0);
+    if (!GetSectionView(mod, ".text", text)) {
+        return Memcury::Scanner(Memcury::PE::Address(nullptr));
+    }
 
     const auto ref = FindRipLeaReference(text.base, text.size, strAddr);
-    if (!ref) return Memcury::Scanner(0);
+    if (!ref) {
+        return Memcury::Scanner(Memcury::PE::Address(nullptr));
+    }
 
     return Memcury::Scanner(ref);
 }
 
 // ===================================================================
-// BRUTE-FORCE PATCH FOR Error_CannotModifyCookedAssets (already working)
+// BRUTE-FORCE PATCH FOR Error_CannotModifyCookedAssets
 // ===================================================================
 static uintptr_t FindCannotModifyCookedAssetsPatchAddress() {
     std::cout << "[+] Searching for Error_CannotModifyCookedAssets (PROCESS-WIDE ultra-aggressive mode)...\n";
@@ -217,14 +219,14 @@ void Main(const HMODULE hModule) {
 
     std::cout << "[+] Cooked asset check module: " << (usingValkyrieModule ? "Valkyrie.dll" : "Main module") << "\n";
 
-    // ==================== Error_CannotModifyCookedAssets (already succeeded) ====================
+    // Error_CannotModifyCookedAssets (already working)
     auto cookedAssetPatchAddress = FindCannotModifyCookedAssetsPatchAddress();
     MemcuryAssertM(cookedAssetPatchAddress, "AOB scan failed for Error_CannotModifyCookedAssets patch!");
 
-    writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01, 0xC3 }); // mov al, 1; ret
+    writeMemory(cookedAssetPatchAddress, { 0xB0, 0x01, 0xC3 });
     std::cout << "[+] Brute-force return-true patch applied to Error_CannotModifyCookedAssets!\n";
 
-    // ==================== FIXED: AssetCantBeEdited (now uses the same aggressive method) ====================
+    // FIXED: AssetCantBeEdited now uses the same aggressive search that worked for the first string
     std::cout << "[+] Searching for AssetCantBeEdited / NotifyBlockedByCookedAsset (aggressive mode)...\n";
 
     auto AssetCantBeEdited = FindStringRefAggressive(L"AssetCantBeEdited");
@@ -237,7 +239,7 @@ void Main(const HMODULE hModule) {
     writeMemory(AssetCantBeEdited.ScanFor(xorByte).Get(), { 0xB3, 0x01 });
     std::cout << "[+] mov bl, 1 patch applied to AssetCantBeEdited / NotifyBlockedByCookedAsset!\n";
 
-    // ==================== Remaining patches (unchanged) ====================
+    // Remaining patches
     writeMemory(
         Memcury::Scanner::FindStringRef(L"Folder '{0}' is read only and its contents cannot be edited")
         .ScanFor(jneBytes, false).Get(),
