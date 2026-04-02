@@ -1,0 +1,25 @@
+name: Building
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Download the Repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Compile
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: msbuild /p:Configuration=Release /p:Platform=x64
+
+    - name: Uploading artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: UEFN Unlocker
+        path: "**/*.dll"
+        if-no-files-found: error
