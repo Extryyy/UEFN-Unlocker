@@ -11,3 +11,4 @@ You must be logged in Github, go to the [Actions tab](https://github.com/gamerbr
 ## Injecting the DLL
 
 There are a lot of ways to inject a DLL into a program, for example [Process Hacker](https://processhacker.sourceforge.io/) (the one that I use), [Cheat Engine](https://cheatengine.org), etc... Just search a tutorial in the internet.
+
